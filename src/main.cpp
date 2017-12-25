@@ -45,9 +45,11 @@ along with Mod Organizer.  If not, see <http://www.gnu.org/licenses/>.
 #include "tutorialmanager.h"
 #include "nxmaccessmanager.h"
 #include "instancemanager.h"
+#include "moshortcut.h"
 
 #include <eh.h>
 #include <windows_error.h>
+#include <usvfs.h>
 
 #include <QApplication>
 #include <QPushButton>
@@ -119,79 +121,22 @@ bool bootstrap()
   return true;
 }
 
-
-bool isNxmLink(const QString &link)
-{
-  return link.startsWith("nxm://", Qt::CaseInsensitive);
-}
+LPTOP_LEVEL_EXCEPTION_FILTER prevUnhandledExceptionFilter = nullptr;
 
 static LONG WINAPI MyUnhandledExceptionFilter(struct _EXCEPTION_POINTERS *exceptionPtrs)
 {
-  typedef BOOL (WINAPI *FuncMiniDumpWriteDump)(HANDLE process, DWORD pid, HANDLE file, MINIDUMP_TYPE dumpType,
-                                               const PMINIDUMP_EXCEPTION_INFORMATION exceptionParam,
-                                               const PMINIDUMP_USER_STREAM_INFORMATION userStreamParam,
-                                               const PMINIDUMP_CALLBACK_INFORMATION callbackParam);
-  LONG result = EXCEPTION_CONTINUE_SEARCH;
+  const std::wstring& dumpPath = OrganizerCore::crashDumpsPath();
+  int dumpRes =
+    CreateMiniDump(exceptionPtrs, OrganizerCore::getGlobalCrashDumpsType(), dumpPath.c_str());
+  if (!dumpRes)
+    qCritical("ModOrganizer has crashed, crash dump created.");
+  else
+    qCritical("ModOrganizer has crashed, CreateMiniDump failed (%d, error %lu).", dumpRes, GetLastError());
 
-  HMODULE dbgDLL = ::LoadLibrary(L"dbghelp.dll");
-
-  static const int errorLen = 200;
-  char errorBuffer[errorLen + 1];
-  memset(errorBuffer, '\0', errorLen + 1);
-
-  if (dbgDLL) {
-    FuncMiniDumpWriteDump funcDump = (FuncMiniDumpWriteDump)::GetProcAddress(dbgDLL, "MiniDumpWriteDump");
-    if (funcDump) {
-      QString dataPath = qApp->property("dataPath").toString();
-      QString exeName = QFileInfo(qApp->applicationFilePath()).fileName();
-      QString dumpName = dataPath + "/" + exeName + ".dmp";
-
-      if (QMessageBox::question(nullptr, QObject::tr("Woops"),
-                                QObject::tr("ModOrganizer has crashed! "
-                                            "Should a diagnostic file be created? "
-                                            "If you send me this file (%1) to modorganizer@gmail.com, "
-                                            "the bug is a lot more likely to be fixed. "
-                                            "Please include a short description of what you were "
-                                            "doing when the crash happened"
-                                            ).arg(dumpName),
-                                QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) {
-
-        HANDLE dumpFile = ::CreateFile(dumpName.toStdWString().c_str(),
-                                       GENERIC_WRITE, FILE_SHARE_WRITE, nullptr,
-                                       CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (dumpFile != INVALID_HANDLE_VALUE) {
-          _MINIDUMP_EXCEPTION_INFORMATION exceptionInfo;
-          exceptionInfo.ThreadId = ::GetCurrentThreadId();
-          exceptionInfo.ExceptionPointers = exceptionPtrs;
-          exceptionInfo.ClientPointers = false;
-
-          BOOL success = funcDump(::GetCurrentProcess(), ::GetCurrentProcessId(), dumpFile,
-                                  MiniDumpNormal, &exceptionInfo, nullptr, nullptr);
-
-          ::FlushFileBuffers(dumpFile);
-          ::CloseHandle(dumpFile);
-          if (success) {
-            return EXCEPTION_EXECUTE_HANDLER;
-          }
-          _snprintf(errorBuffer, errorLen, "failed to save minidump to %ls (error %lu)",
-                    dumpName.toStdWString().c_str(), ::GetLastError());
-        } else {
-          _snprintf(errorBuffer, errorLen, "failed to create %ls (error %lu)",
-                    dumpName.toStdWString().c_str(), ::GetLastError());
-        }
-      } else {
-        return result;
-      }
-    } else {
-      _snprintf(errorBuffer, errorLen, "dbghelp.dll outdated");
-    }
-  } else {
-    _snprintf(errorBuffer, errorLen, "dbghelp.dll not found");
-  }
-
-  QMessageBox::critical(nullptr, QObject::tr("Woops"),
-                        QObject::tr("ModOrganizer has crashed! Unfortunately I was not able to write a diagnostic file: %1").arg(errorBuffer));
-  return result;
+  if (prevUnhandledExceptionFilter)
+    return prevUnhandledExceptionFilter(exceptionPtrs);
+  else
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
 static bool HaveWriteAccess(const std::wstring &path)
@@ -318,6 +263,9 @@ MOBase::IPluginGame *determineCurrentGame(QString const &moPath, QSettings &sett
     }
   }
 
+  //The following code would try to determine the right game to mange but it would usually find the wrong one
+  //so it was commented out.
+  /* 
   //OK, we are in a new setup or existing info is useless.
   //See if MO has been installed inside a game directory
   for (IPluginGame * const game : plugins.plugins<IPluginGame>()) {
@@ -341,6 +289,7 @@ MOBase::IPluginGame *determineCurrentGame(QString const &moPath, QSettings &sett
       //OK, chop off the last directory and try again
     } while (gameDir.cdUp());
   }
+  */
 
   //Then try a selection dialogue.
   if (!gamePath.isEmpty() || !gameName.isEmpty()) {
@@ -419,8 +368,6 @@ int runApplication(MOApplication &application, SingleInstance &instance,
                    const QString &splashPath)
 {
   qDebug("start main application");
-  QPixmap pixmap(splashPath);
-  QSplashScreen splash(pixmap);
 
   QString dataPath = application.property("dataPath").toString();
   qDebug("data path: %s", qPrintable(dataPath));
@@ -434,16 +381,14 @@ int runApplication(MOApplication &application, SingleInstance &instance,
 
   try {
     qDebug("Working directory: %s", qPrintable(QDir::toNativeSeparators(QDir::currentPath())));
-    splash.show();
-  } catch (const std::exception &e) {
-    reportError(e.what());
-    return 1;
-  }
 
-  try {
     QSettings settings(dataPath + "/"
                            + QString::fromStdWString(AppConfig::iniFileName()),
                        QSettings::IniFormat);
+
+    // global crashDumpType sits in OrganizerCore to make a bit less ugly to update it when the settings are changed during runtime
+    OrganizerCore::setGlobalCrashDumpsType(settings.value("Settings/crash_dumps_type", static_cast<int>(CrashDumpsType::Mini)).toInt());
+
     qDebug("initializing core");
     OrganizerCore organizer(settings);
     if (!organizer.bootstrap()) {
@@ -506,7 +451,16 @@ int runApplication(MOApplication &application, SingleInstance &instance,
     // if we have a command line parameter, it is either a nxm link or
     // a binary to start
     if (arguments.size() > 1) {
-      if (isNxmLink(arguments.at(1))) {
+      if (MOShortcut shortcut{ arguments.at(1) }) {
+        try {
+          organizer.runShortcut(shortcut);
+          return 0;
+        } catch (const std::exception &e) {
+          reportError(
+            QObject::tr("failed to start shortcut: %1").arg(e.what()));
+          return 1;
+        }
+      } else if (OrganizerCore::isNxmLink(arguments.at(1))) {
         qDebug("starting download from command line: %s",
                qPrintable(arguments.at(1)));
         organizer.externalMessage(arguments.at(1));
@@ -526,6 +480,10 @@ int runApplication(MOApplication &application, SingleInstance &instance,
         }
       }
     }
+
+    QPixmap pixmap(splashPath);
+    QSplashScreen splash(pixmap);
+    splash.show();
 
     NexusInterface::instance()->getAccessManager()->startLoginCheck();
 
@@ -567,8 +525,6 @@ int runApplication(MOApplication &application, SingleInstance &instance,
 
 int main(int argc, char *argv[])
 {
-  SetUnhandledExceptionFilter(MyUnhandledExceptionFilter);
-
   MOApplication application(argc, argv);
   QStringList arguments = application.arguments();
 
@@ -597,10 +553,14 @@ int main(int argc, char *argv[])
     forcePrimary = true;
   }
 
+  MOShortcut moshortcut{ arguments.size() > 1 ? arguments.at(1) : "" };
+
   SingleInstance instance(forcePrimary);
   if (!instance.primaryInstance()) {
-    if ((arguments.size() == 2) && isNxmLink(arguments.at(1))) {
-      qDebug("not primary instance, sending download message");
+    if (moshortcut ||
+        arguments.size() > 1 && OrganizerCore::isNxmLink(arguments.at(1)))
+    {
+      qDebug("not primary instance, sending shortcut/download message");
       instance.sendMessage(arguments.at(1));
       return 0;
     } else if (arguments.size() == 1) {
@@ -615,15 +575,21 @@ int main(int argc, char *argv[])
     QString dataPath;
 
     try {
-      dataPath = InstanceManager::instance().determineDataPath();
+      InstanceManager& instanceManager = InstanceManager::instance();
+      if (moshortcut && moshortcut.hasInstance())
+        instanceManager.overrideInstance(moshortcut.instance());
+      dataPath = instanceManager.determineDataPath();
     } catch (const std::exception &e) {
-      QMessageBox::critical(nullptr, QObject::tr("Failed to set up instance"),
-                            e.what());
+      if (strcmp(e.what(),"Canceled"))
+        QMessageBox::critical(nullptr, QObject::tr("Failed to set up instance"), e.what());
       return 1;
     }
     application.setProperty("dataPath", dataPath);
 
-    LogBuffer::init(100, QtDebugMsg, qApp->property("dataPath").toString() + "/logs/mo_interface.log");
+    // initialize dump collection only after "dataPath" since the crashes are stored under it
+    prevUnhandledExceptionFilter = SetUnhandledExceptionFilter(MyUnhandledExceptionFilter);
+
+    LogBuffer::init(1000, QtDebugMsg, qApp->property("dataPath").toString() + "/logs/mo_interface.log");
 
     QString splash = dataPath + "/splash.png";
     if (!QFile::exists(dataPath + "/splash.png")) {

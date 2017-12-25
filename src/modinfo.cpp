@@ -79,10 +79,11 @@ ModInfo::Ptr ModInfo::createFrom(const QDir &dir, DirectoryEntry **directoryStru
 ModInfo::Ptr ModInfo::createFromPlugin(const QString &modName,
                                        const QString &espName,
                                        const QStringList &bsaNames,
+                                       ModInfo::EModType modType,
                                        DirectoryEntry **directoryStructure) {
   QMutexLocker locker(&s_Mutex);
   ModInfo::Ptr result = ModInfo::Ptr(
-      new ModInfoForeign(modName, espName, bsaNames, directoryStructure));
+      new ModInfoForeign(modName, espName, bsaNames, modType, directoryStructure));
   s_Collection.push_back(result);
   return result;
 }
@@ -93,12 +94,13 @@ QString ModInfo::getContentTypeName(int contentType)
     case CONTENT_PLUGIN:    return tr("Plugins");
     case CONTENT_TEXTURE:   return tr("Textures");
     case CONTENT_MESH:      return tr("Meshes");
-    case CONTENT_BSA:       return tr("BSA");
+    case CONTENT_BSA:       return tr("Bethesda Archive");
     case CONTENT_INTERFACE: return tr("UI Changes");
     case CONTENT_SOUND:     return tr("Sound Effects");
     case CONTENT_SCRIPT:    return tr("Scripts");
     case CONTENT_SKSE:      return tr("SKSE Plugins");
     case CONTENT_SKYPROC:   return tr("SkyProc Tools");
+    case CONTENT_MCM:       return tr("MCM Data");
     default: throw MyException(tr("invalid content type %1").arg(contentType));
   }
 }
@@ -121,9 +123,10 @@ ModInfo::Ptr ModInfo::getByIndex(unsigned int index)
 {
   QMutexLocker locker(&s_Mutex);
 
-  if (index >= s_Collection.size()) {
+  if (index >= s_Collection.size() && index != ULONG_MAX) {
     throw MyException(tr("invalid mod index %1").arg(index));
   }
+  if (index == ULONG_MAX) return s_Collection[ModInfo::getIndex("Overwrite")];
   return s_Collection[index];
 }
 
@@ -223,9 +226,13 @@ void ModInfo::updateFromDisc(const QString &modDirectory,
   UnmanagedMods *unmanaged = game->feature<UnmanagedMods>();
   if (unmanaged != nullptr) {
     for (const QString &modName : unmanaged->mods(!displayForeign)) {
+      ModInfo::EModType modType = game->DLCPlugins().contains(unmanaged->referenceFile(modName).fileName(), Qt::CaseInsensitive) ? ModInfo::EModType::MOD_DLC :
+                         (game->CCPlugins().contains(unmanaged->referenceFile(modName).fileName(), Qt::CaseInsensitive) ? ModInfo::EModType::MOD_CC : ModInfo::EModType::MOD_DEFAULT);
+
       createFromPlugin(unmanaged->displayName(modName),
                        unmanaged->referenceFile(modName).absoluteFilePath(),
                        unmanaged->secondaryFiles(modName),
+                       modType,
                        directoryStructure);
     }
   }
@@ -298,6 +305,11 @@ int ModInfo::checkAllForUpdate(QObject *receiver)
 void ModInfo::setVersion(const VersionInfo &version)
 {
   m_Version = version;
+}
+
+void ModInfo::setPluginSelected(const bool &isSelected)
+{
+  m_PluginSelected = isSelected;
 }
 
 void ModInfo::addCategory(const QString &categoryName)

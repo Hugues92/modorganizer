@@ -35,7 +35,7 @@ along with Mod Organizer.  If not, see <http://www.gnu.org/licenses/>.
 //when I get round to cleaning up main.cpp
 struct Executable;
 class CategoryFactory;
-class LockedDialog;
+class LockedDialogBase;
 class OrganizerCore;
 #include "plugincontainer.h" //class PluginContainer;
 class PluginListSortProxy;
@@ -116,17 +116,18 @@ public:
   void storeSettings(QSettings &settings) override;
   void readSettings();
 
-  virtual void lock() override;
+  virtual ILockedWaitingForProcess* lock() override;
   virtual void unlock() override;
-  virtual bool unlockClicked() override;
-  virtual void setProcessName(QString const &name) override;
 
   bool addProfile();
+  void updateBSAList(const QStringList &defaultArchives, const QStringList &activeArchives);
   void refreshDataTree();
   void refreshSaveList();
 
   void setModListSorting(int index);
   void setESPListSorting(int index);
+
+  void saveArchiveList();
 
   void registerPluginTool(MOBase::IPluginTool *tool);
   void registerModPage(MOBase::IPluginModPage *modPage);
@@ -149,6 +150,8 @@ public:
 
   virtual bool closeWindow();
   virtual void setWindowEnabled(bool enabled);
+
+  virtual MOBase::DelayedFileWriterBase &archivesWriter() override { return m_ArchiveListWriter; }
 
 public slots:
 
@@ -216,8 +219,6 @@ private:
   void testExtractBSA(int modIndex);
 
   void writeDataToFile(QFile &file, const QString &directory, const MOShared::DirectoryEntry &directoryEntry);
-
-  void renameModInList(QFile &modList, const QString &oldName, const QString &newName);
 
   void refreshFilters();
 
@@ -348,12 +349,18 @@ private:
 
   std::vector<QTreeWidgetItem*> m_RemoveWidget;
 
+  QByteArray m_ArchiveListHash;
+
   bool m_DidUpdateMasterList;
 
-  LockedDialog *m_LockDialog { nullptr };
+  LockedDialogBase *m_LockDialog { nullptr };
   uint64_t m_LockCount { 0 };
 
+  bool m_closing{ false };
+
   std::vector<std::pair<QString, QHeaderView*>> m_PersistedGeometry;
+
+  MOBase::DelayedFileWriter m_ArchiveListWriter;
 
   enum class ShortcutType {
     Toolbar,
@@ -478,6 +485,8 @@ private slots:
 
   void startExeAction();
 
+  void checkBSAList();
+
   void updateProblemsButton();
 
   void saveModMetas();
@@ -520,6 +529,9 @@ private slots:
   void modlistSelectionChanged(const QModelIndex &current, const QModelIndex &previous);
   void modListSortIndicatorChanged(int column, Qt::SortOrder order);
 
+  void modlistSelectionsChanged(const QItemSelection &current);
+  void esplistSelectionsChanged(const QItemSelection &current);
+
 private slots: // ui slots
   // actions
   void on_actionAdd_Profile_triggered();
@@ -549,6 +561,7 @@ private slots: // ui slots
   void on_categoriesList_itemSelectionChanged();
   void on_linkButton_pressed();
   void on_showHiddenBox_toggled(bool checked);
+  void on_bsaList_itemChanged(QTreeWidgetItem *item, int column);
   void on_bossButton_clicked();
 
   void on_saveButton_clicked();
@@ -558,6 +571,7 @@ private slots: // ui slots
   void on_actionCopy_Log_to_Clipboard_triggered();
   void on_categoriesAndBtn_toggled(bool checked);
   void on_categoriesOrBtn_toggled(bool checked);
+  void on_managedArchiveLabel_linkHovered(const QString &link);
 };
 
 

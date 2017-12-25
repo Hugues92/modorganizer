@@ -31,6 +31,8 @@
 #include "appconfig.h"
 #include <report.h>
 #include <questionboxmemory.h>
+#include "lockeddialog.h"
+#include "instancemanager.h"
 
 #include <QApplication>
 #include <QCoreApplication>
@@ -47,6 +49,7 @@
 #include <QtGlobal> // for qPrintable, etc
 
 #include <Psapi.h>
+#include <Shlobj.h>
 #include <tchar.h> // for _tcsicmp
 
 #include <limits.h>
@@ -65,6 +68,9 @@
 
 using namespace MOShared;
 using namespace MOBase;
+
+//static
+CrashDumpsType OrganizerCore::m_globalCrashDumpsType = CrashDumpsType::None;
 
 static bool isOnline()
 {
@@ -99,22 +105,24 @@ static bool renameFile(const QString &oldName, const QString &newName,
   return QFile::rename(oldName, newName);
 }
 
-static std::wstring getProcessName(DWORD processId)
+static std::wstring getProcessName(HANDLE process)
 {
-  HANDLE process = ::OpenProcess(PROCESS_QUERY_INFORMATION, false, processId);
+	wchar_t buffer[MAX_PATH];
+	wchar_t *fileName = L"unknown";
 
-  wchar_t buffer[MAX_PATH];
-  if (::GetProcessImageFileNameW(process, buffer, MAX_PATH) != 0) {
-    wchar_t *fileName = wcsrchr(buffer, L'\\');
-    if (fileName == nullptr) {
-      fileName = buffer;
-    } else {
-      fileName += 1;
-    }
-    return fileName;
-  } else {
-    return std::wstring(L"unknown");
-  }
+	if (process == nullptr) return fileName;
+
+	if (::GetProcessImageFileNameW(process, buffer, MAX_PATH) != 0) {
+		fileName = wcsrchr(buffer, L'\\');
+		if (fileName == nullptr) {
+			fileName = buffer;
+		}
+		else {
+			fileName += 1;
+		}
+	}
+
+	return fileName;
 }
 
 static void startSteam(QWidget *widget)
@@ -363,6 +371,12 @@ bool OrganizerCore::testForSteam()
           PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processIDs[i]);
 
       if (process != nullptr) {
+
+		  ON_BLOCK_EXIT([&]() {
+			  if (process != INVALID_HANDLE_VALUE)
+				  ::CloseHandle(process);
+		  });
+
         HMODULE module;
         DWORD ignore;
 
@@ -565,7 +579,10 @@ void OrganizerCore::downloadRequestedNXM(const QString &url)
 
 void OrganizerCore::externalMessage(const QString &message)
 {
-  if (message.left(6).toLower() == "nxm://") {
+  if (MOShortcut moshortcut{ message }) {
+    runShortcut(moshortcut);
+  }
+  else if (isNxmLink(message)) {
     MessageDialog::showMessage(tr("Download started"), qApp->activeWindow());
     downloadRequestedNXM(message);
   }
@@ -618,7 +635,8 @@ bool OrganizerCore::bootstrap() {
   return createDirectory(m_Settings.getProfileDirectory()) &&
          createDirectory(m_Settings.getModDirectory()) &&
          createDirectory(m_Settings.getDownloadDirectory()) &&
-         createDirectory(m_Settings.getOverwriteDirectory());
+         createDirectory(m_Settings.getOverwriteDirectory()) &&
+         createDirectory(QString::fromStdWString(crashDumpsPath())) && cycleDiagnostics();
 }
 
 void OrganizerCore::createDefaultProfile()
@@ -635,8 +653,28 @@ void OrganizerCore::prepareVFS()
   m_USVFS.updateMapping(fileMapping(m_CurrentProfile->name(), QString()));
 }
 
-void OrganizerCore::setLogLevel(int logLevel) {
-  m_USVFS.setLogLevel(logLevel);
+void OrganizerCore::updateVFSParams(int logLevel, int crashDumpsType) {
+  setGlobalCrashDumpsType(crashDumpsType);
+  m_USVFS.updateParams(logLevel, crashDumpsType);
+}
+
+bool OrganizerCore::cycleDiagnostics() {
+  if (int maxDumps = settings().crashDumpsMax())
+    removeOldFiles(QString::fromStdWString(crashDumpsPath()), "*.dmp", maxDumps, QDir::Time|QDir::Reversed);
+  return true;
+}
+
+//static
+void OrganizerCore::setGlobalCrashDumpsType(int crashDumpsType) {
+  m_globalCrashDumpsType = ::crashDumpsType(crashDumpsType);
+}
+
+//static
+std::wstring OrganizerCore::crashDumpsPath() {
+  return (
+    qApp->property("dataPath").toString() + "/"
+    + QString::fromStdWString(AppConfig::dumpsDir())
+    ).toStdWString();
 }
 
 void OrganizerCore::setCurrentProfile(const QString &profileName)
@@ -965,9 +1003,9 @@ QStringList OrganizerCore::getFileOrigins(const QString &fileName) const
   if (file.get() != nullptr) {
     result.append(ToQString(
         m_DirectoryStructure->getOriginByID(file->getOrigin()).getName()));
-    foreach (int i, file->getAlternatives()) {
+    foreach (auto i, file->getAlternatives()) {
       result.append(
-          ToQString(m_DirectoryStructure->getOriginByID(i).getName()));
+          ToQString(m_DirectoryStructure->getOriginByID(i.first).getName()));
     }
   } else {
     qDebug("%s not found", qPrintable(fileName));
@@ -993,9 +1031,9 @@ QList<MOBase::IOrganizer::FileInfo> OrganizerCore::findFileInfos(
           m_DirectoryStructure->getOriginByID(file->getOrigin(fromArchive))
               .getName()));
       info.archive = fromArchive ? ToQString(file->getArchive()) : "";
-      foreach (int idx, file->getAlternatives()) {
+      foreach (auto idx, file->getAlternatives()) {
         info.origins.append(
-            ToQString(m_DirectoryStructure->getOriginByID(idx).getName()));
+            ToQString(m_DirectoryStructure->getOriginByID(idx.first).getName()));
       }
 
       if (filter(info)) {
@@ -1033,18 +1071,9 @@ QStringList OrganizerCore::modsSortedByProfilePriority() const
 
 void OrganizerCore::spawnBinary(const QFileInfo &binary, const QString &arguments, const QDir &currentDirectory, const QString &steamAppID, const QString &customOverwrite)
 {
-  if (m_UserInterface != nullptr) {
-    m_UserInterface->lock();
-  }
-  ON_BLOCK_EXIT([&] () {
-    if (m_UserInterface != nullptr) { m_UserInterface->unlock(); }
-  });
-
-  HANDLE processHandle = spawnBinaryDirect(binary, arguments, m_CurrentProfile->name(), currentDirectory, steamAppID, customOverwrite);
+  DWORD processExitCode = 0;
+  HANDLE processHandle = spawnBinaryDirect(binary, arguments, m_CurrentProfile->name(), currentDirectory, steamAppID, customOverwrite, &processExitCode);
   if (processHandle != INVALID_HANDLE_VALUE) {
-    DWORD processExitCode;
-    (void)waitForProcessCompletion(processHandle, &processExitCode);
-
     refreshDirectoryStructure();
     // need to remove our stored load order because it may be outdated if a foreign tool changed the
     // file time. After removing that file, refreshESPList will use the file time as the order
@@ -1067,7 +1096,45 @@ HANDLE OrganizerCore::spawnBinaryDirect(const QFileInfo &binary,
                                         const QString &profileName,
                                         const QDir &currentDirectory,
                                         const QString &steamAppID,
-                                        const QString &customOverwrite)
+                                        const QString &customOverwrite,
+                                        LPDWORD exitCode)
+{
+  HANDLE processHandle = spawnBinaryProcess(binary, arguments, profileName, currentDirectory, steamAppID, customOverwrite);
+  if (processHandle != INVALID_HANDLE_VALUE) {
+    std::unique_ptr<LockedDialog> dlg;
+    ILockedWaitingForProcess* uilock = nullptr;
+
+    if (m_UserInterface != nullptr) {
+      uilock = m_UserInterface->lock();
+    }
+    else {
+      // i.e. when running command line shortcuts there is no m_UserInterface
+      dlg.reset(new LockedDialog);
+      dlg->show();
+      dlg->setEnabled(true);
+      uilock = dlg.get();
+    }
+
+    ON_BLOCK_EXIT([&]() {
+      if (m_UserInterface != nullptr) {
+        m_UserInterface->unlock();
+      } });
+
+    DWORD ignoreExitCode;
+    waitForProcessCompletion(processHandle, exitCode ? exitCode : &ignoreExitCode, uilock);
+    cycleDiagnostics();
+  }
+
+  return processHandle;
+}
+
+
+HANDLE OrganizerCore::spawnBinaryProcess(const QFileInfo &binary,
+                                         const QString &arguments,
+                                         const QString &profileName,
+                                         const QDir &currentDirectory,
+                                         const QString &steamAppID,
+                                         const QString &customOverwrite)
 {
   prepareStart();
 
@@ -1115,7 +1182,7 @@ HANDLE OrganizerCore::spawnBinaryDirect(const QFileInfo &binary,
 
   // need to make sure all data is saved before we start the application
   if (m_CurrentProfile != nullptr) {
-    m_CurrentProfile->modlistWriter().writeImmediately(true);
+    m_CurrentProfile->writeModlistNow(true);
   }
 
   // TODO: should also pass arguments
@@ -1146,9 +1213,13 @@ HANDLE OrganizerCore::spawnBinaryDirect(const QFileInfo &binary,
           = QString("launch \"%1\" \"%2\" %3")
                 .arg(QDir::toNativeSeparators(dataCwd),
                      QDir::toNativeSeparators(dataBinPath), arguments);
+
+      qDebug() << "Spawning proxyed process <" << cmdline << ">";
+
       return startBinary(QFileInfo(QCoreApplication::applicationFilePath()),
                          cmdline, QCoreApplication::applicationDirPath(), true);
     } else {
+      qDebug() << "Spawning direct process <" << binary.absoluteFilePath() << "," << arguments << "," << currentDirectory.absolutePath() << ">";
       return startBinary(binary, arguments, currentDirectory, true);
     }
   } else {
@@ -1156,6 +1227,25 @@ HANDLE OrganizerCore::spawnBinaryDirect(const QFileInfo &binary,
            qPrintable(binary.absoluteFilePath()));
     return INVALID_HANDLE_VALUE;
   }
+}
+
+HANDLE OrganizerCore::runShortcut(const MOShortcut& shortcut)
+{
+  if (shortcut.hasInstance() && shortcut.instance() != InstanceManager::instance().currentInstance())
+    throw std::runtime_error(
+      QString("Refusing to run executable from different instance %1:%2")
+      .arg(shortcut.instance(),shortcut.executable())
+      .toLocal8Bit().constData());
+
+  Executable& exe = m_ExecutablesList.find(shortcut.executable());
+
+  return spawnBinaryDirect(
+    exe.m_BinaryInfo, exe.m_Arguments,
+    m_CurrentProfile->name(),
+    exe.m_WorkingDirectory.length() != 0
+    ? exe.m_WorkingDirectory
+    : exe.m_BinaryInfo.absolutePath(),
+    exe.m_SteamAppID, "");
 }
 
 HANDLE OrganizerCore::startApplication(const QString &executable,
@@ -1219,94 +1309,115 @@ HANDLE OrganizerCore::startApplication(const QString &executable,
     }
   }
 
-  return spawnBinaryDirect(binary, arguments, profileName, currentDirectory,
-                           steamAppID, customOverwrite);
+  return spawnBinaryDirect(binary, arguments, profileName, currentDirectory, steamAppID, customOverwrite);
 }
 
 bool OrganizerCore::waitForApplication(HANDLE handle, LPDWORD exitCode)
 {
+  ILockedWaitingForProcess* uilock = nullptr;
   if (m_UserInterface != nullptr) {
-    m_UserInterface->lock();
+    uilock = m_UserInterface->lock();
   }
 
   ON_BLOCK_EXIT([&] () {
     if (m_UserInterface != nullptr) {
       m_UserInterface->unlock();
     } });
-  return waitForProcessCompletion(handle, exitCode);
+  return waitForProcessCompletion(handle, exitCode, uilock);
 }
 
-bool OrganizerCore::waitForProcessCompletion(HANDLE handle, LPDWORD exitCode)
+bool OrganizerCore::waitForProcessCompletion(HANDLE handle, LPDWORD exitCode, ILockedWaitingForProcess* uilock)
 {
-  HANDLE processHandle = handle;
+  bool originalHandle = true;
+  bool newHandle = true;
+  bool uiunlocked = false;
 
-  static const DWORD maxCount = 5;
-  size_t numProcesses         = maxCount;
-  LPDWORD processes = new DWORD[maxCount];
+  constexpr DWORD INPUT_EVENT = WAIT_OBJECT_0 + 1;
+  DWORD res = WAIT_TIMEOUT;
+  while (handle != INVALID_HANDLE_VALUE && (newHandle || res == WAIT_TIMEOUT || res == INPUT_EVENT))
+  {
+    if (newHandle) {
+      QString processName = QString::fromStdWString(getProcessName(handle));
+      processName += QString(" (%1)").arg(GetProcessId(handle));
+      if (uilock)
+        uilock->setProcessName(processName);
+      qDebug() << "Waiting for"
+        << (originalHandle ? "spawned" : "usvfs")
+        << "process completion :" << processName.toUtf8().constData();
+      newHandle = false;
+    }
 
-  DWORD currentProcess = 0UL;
-  bool tryAgain = true;
-
-  DWORD res;
-  // Wait for a an event on the handle, a key press, mouse click or timeout
-  //TODO: Remove MOBase::isOneOf from this query as it was always returning true.
-  while (
-      res = ::MsgWaitForMultipleObjects(1, &handle, false, 500,
-                                        QS_KEY | QS_MOUSE),
-      ((res != WAIT_FAILED) || (res != WAIT_OBJECT_0)) &&
-       ((m_UserInterface == nullptr) || !m_UserInterface->unlockClicked())) {
-
-    if (!::GetVFSProcessList(&numProcesses, processes)) {
+    // Wait for a an event on the handle, a key press, mouse click or timeout
+    res = MsgWaitForMultipleObjects(1, &handle, FALSE, 200, QS_KEY | QS_MOUSEBUTTON);
+    if (res == WAIT_FAILED) {
+      qWarning() << "Failed waiting for process completion : MsgWaitForMultipleObjects WAIT_FAILED" << GetLastError();
       break;
     }
 
-    bool found = false;
-    size_t count =
-        std::min<size_t>(static_cast<size_t>(maxCount), numProcesses);
-    for (size_t i = 0; i < count; ++i) {
-      std::wstring processName = getProcessName(processes[i]);
-      if (!boost::starts_with(processName, L"ModOrganizer.exe")) {
-		currentProcess = processes[i];
-        m_UserInterface->setProcessName(QString::fromStdWString(processName));
-		processHandle = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, currentProcess);
-        found = true;
-      }
-    }
-    if (!found) {
-      // it's possible the previous process has deregistered before
-      // the new one has registered, so we should try one more time
-      // with a little delay
-      if (tryAgain) {
-        tryAgain = false;
-        QThread::msleep(500);
-        continue;
-      } else {
-        break;
-      }
-    } else {
-      tryAgain = true;
-    }
-
     // keep processing events so the app doesn't appear dead
+    QCoreApplication::sendPostedEvents();
     QCoreApplication::processEvents();
-  }
 
-  if (exitCode != nullptr) {
-    //This is actually wrong if the process we started finished before we
-    //got the event and so we end up with a job handle.
-    if (! ::GetExitCodeProcess(processHandle, exitCode))
-    {
-      DWORD error = ::GetLastError();
-      qDebug() << "Failed to get process exit code: Error " << error;
+    if (uilock && uilock->unlockForced()) {
+      uiunlocked = true;
+      break;
+    }
+
+    if (res == WAIT_OBJECT_0) {
+      // process we were waiting on has completed
+      if (originalHandle && exitCode && !::GetExitCodeProcess(handle, exitCode))
+        qWarning() << "Failed getting exit code of complete process :" << GetLastError();
+      CloseHandle(handle);
+      handle = INVALID_HANDLE_VALUE;
+      originalHandle = false;
+
+      // if the previous process spawned a child process and immediately exits we may miss it if we check immediately
+      for (int i = 0; i < 3; ++i) {
+        QThread::msleep(200);
+        QCoreApplication::sendPostedEvents();
+        QCoreApplication::processEvents();
+      }
+
+      // search if there is another usvfs process active and if so wait for it
+      handle = findAndOpenAUSVFSProcess();
+      newHandle = handle != INVALID_HANDLE_VALUE;
     }
   }
 
-  ::CloseHandle(processHandle);
-  if (handle != processHandle) {
+  if (res == WAIT_OBJECT_0)
+    qDebug() << "Waiting for process completion successfull";
+  else if (uiunlocked)
+    qDebug() << "Waiting for process completion aborted by UI";
+  else
+    qDebug() << "Waiting for process completion not successfull :" << res;
+
+  if (handle != INVALID_HANDLE_VALUE)
     ::CloseHandle(handle);
-  }
 
   return res == WAIT_OBJECT_0;
+}
+
+HANDLE OrganizerCore::findAndOpenAUSVFSProcess() {
+  // in theory a querySize of 1 is probably enough since the MO process doesn't seem to be returned by GetVFSProcessList
+  constexpr size_t querySize = 2; // just to be on the safe side
+  DWORD pids[querySize];
+  size_t found = querySize;
+  if (!::GetVFSProcessList(&found, pids)) {
+    qWarning() << "Failed seeking USVFS processes : GetVFSProcessList failed?!";
+    return INVALID_HANDLE_VALUE;
+  }
+
+  for (size_t i = 0; i < found; ++i) {
+    if (pids[i] == GetCurrentProcessId())
+      continue; // obviously don't wait for MO process
+    HANDLE handle = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pids[i]);
+    if (handle != INVALID_HANDLE_VALUE)
+      return handle;
+    else
+      qWarning() << "Failed openning USVFS process " << pids[i] << " : OpenProcess failed" << GetLastError();
+  }
+
+  return INVALID_HANDLE_VALUE;
 }
 
 bool OrganizerCore::onAboutToRun(
@@ -1334,7 +1445,7 @@ void OrganizerCore::refreshModList(bool saveChanges)
 {
   // don't lose changes!
   if (saveChanges) {
-    m_CurrentProfile->modlistWriter().writeImmediately(true);
+    m_CurrentProfile->writeModlistNow(true);
   }
   ModInfo::updateFromDisc(m_Settings.getModDirectory(), &m_DirectoryStructure,
                           m_Settings.displayForeign(), managedGame());
@@ -1356,7 +1467,7 @@ void OrganizerCore::refreshESPList()
     });
     return;
   }
-  m_CurrentProfile->modlistWriter().write();
+  m_CurrentProfile->writeModlist();
 
   // clear list
   try {
@@ -1390,6 +1501,10 @@ void OrganizerCore::refreshBSAList()
     if (m_ActiveArchives.isEmpty()) {
       m_ActiveArchives = m_DefaultArchives;
     }
+    
+    if (m_UserInterface != nullptr) {
+      m_UserInterface->updateBSAList(m_DefaultArchives, m_ActiveArchives);
+    }
 
     m_ArchivesInit = true;
   }
@@ -1413,6 +1528,20 @@ void OrganizerCore::updateModActiveState(int index, bool active)
     m_PluginList.enableESP(esm, active);
   }
   int enabled      = 0;
+  for (const QString &esl :
+       dir.entryList(QStringList() << "*.esl", QDir::Files)) {
+    const FileEntry::Ptr file = m_DirectoryStructure->findFile(ToWString(esl));
+    if (file.get() == nullptr) {
+      qWarning("failed to activate %s", qPrintable(esl));
+      continue;
+    }
+
+    if (active != m_PluginList.isEnabled(esl)
+        && file->getAlternatives().empty()) {
+      m_PluginList.enableESP(esl, active);
+      ++enabled;
+    }
+  }
   QStringList esps = dir.entryList(QStringList() << "*.esp", QDir::Files);
   for (const QString &esp : esps) {
     const FileEntry::Ptr file = m_DirectoryStructure->findFile(ToWString(esp));
@@ -1429,7 +1558,7 @@ void OrganizerCore::updateModActiveState(int index, bool active)
   }
   if (active && (enabled > 1)) {
     MessageDialog::showMessage(
-        tr("Multiple esps activated, please check that they don't conflict."),
+        tr("Multiple esps/esls activated, please check that they don't conflict."),
         qApp->activeWindow());
   }
   m_PluginList.refreshLoadOrder();
@@ -1454,6 +1583,9 @@ void OrganizerCore::updateModInDirectoryStructure(unsigned int index,
   // now we need to refresh the bsa list and save it so there is no confusion
   // about what archives are avaiable and active
   refreshBSAList();
+  if (m_UserInterface != nullptr) {
+    m_UserInterface->archivesWriter().writeImmediately(false);
+  }
 
   std::vector<QString> archives = enabledArchives();
   m_DirectoryRefresher.setMods(
@@ -1545,7 +1677,7 @@ std::vector<QString> OrganizerCore::enabledArchives()
 void OrganizerCore::refreshDirectoryStructure()
 {
   if (!m_DirectoryUpdate) {
-    m_CurrentProfile->modlistWriter().writeImmediately(true);
+    m_CurrentProfile->writeModlistNow(true);
 
     m_DirectoryUpdate = true;
     std::vector<std::tuple<QString, QString, int>> activeModList
@@ -1611,6 +1743,9 @@ void OrganizerCore::modStatusChanged(unsigned int index)
             = m_DirectoryStructure->getOriginByName(ToWString(modInfo->name()));
         origin.enable(false);
       }
+      if (m_UserInterface != nullptr) {
+        m_UserInterface->archivesWriter().write();
+      }
     }
     modInfo->clearCaches();
 
@@ -1645,8 +1780,8 @@ void OrganizerCore::loginSuccessful(bool necessary)
     task();
   }
 
-  m_PostLoginTasks.clear();
-  NexusInterface::instance()->loginCompleted();
+	m_PostLoginTasks.clear();
+	NexusInterface::instance()->loginCompleted();
 }
 
 void OrganizerCore::loginSuccessfulUpdate(bool necessary)
@@ -1723,7 +1858,7 @@ QString OrganizerCore::shortDescription(unsigned int key) const
 {
   switch (key) {
     case PROBLEM_TOOMANYPLUGINS: {
-      return tr("Too many esps and esms enabled");
+      return tr("Too many esps, esms, and esls enabled");
     } break;
     default: {
       return tr("Description missing");
@@ -1767,6 +1902,9 @@ bool OrganizerCore::saveCurrentLists()
 
   try {
     savePluginList();
+    if (m_UserInterface != nullptr) {
+      m_UserInterface->archivesWriter().write();
+    }
   } catch (const std::exception &e) {
     reportError(tr("failed to save load order: %1").arg(e.what()));
   }
@@ -1794,7 +1932,7 @@ void OrganizerCore::prepareStart()
   if (m_CurrentProfile == nullptr) {
     return;
   }
-  m_CurrentProfile->modlistWriter().write();
+  m_CurrentProfile->writeModlist();
   m_CurrentProfile->createTweakedIniFile();
   saveCurrentLists();
   m_Settings.setupLoadMechanism();

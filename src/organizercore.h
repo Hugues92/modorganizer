@@ -13,6 +13,7 @@
 #include "downloadmanager.h"
 #include "executableslist.h"
 #include "usvfsconnector.h"
+#include "moshortcut.h"
 #include <directoryentry.h>
 #include <imoinfo.h>
 #include <iplugindiagnose.h>
@@ -85,6 +86,7 @@ private:
   typedef boost::signals2::signal<void (const QString&)> SignalModInstalled;
 
 public:
+  static bool isNxmLink(const QString &link) { return link.startsWith("nxm://", Qt::CaseInsensitive); }
 
   OrganizerCore(const QSettings &initSettings);
 
@@ -145,7 +147,14 @@ public:
                            const QString &profileName,
                            const QDir &currentDirectory,
                            const QString &steamAppID,
-                           const QString &customOverwrite);
+                           const QString &customOverwrite,
+                           LPDWORD exitCode = nullptr);
+
+  HANDLE spawnBinaryProcess(const QFileInfo &binary, const QString &arguments,
+                            const QString &profileName,
+                            const QDir &currentDirectory,
+                            const QString &steamAppID,
+                            const QString &customOverwrite);
 
   void loginSuccessfulUpdate(bool necessary);
   void loginFailedUpdate(const QString &message);
@@ -158,7 +167,13 @@ public:
 
   void prepareVFS();
 
-  void setLogLevel(int logLevel);
+  void updateVFSParams(int logLevel, int crashDumpsType);
+
+  bool cycleDiagnostics();
+
+  static CrashDumpsType getGlobalCrashDumpsType() { return m_globalCrashDumpsType; }
+  static void setGlobalCrashDumpsType(int crashDumpsType);
+  static std::wstring crashDumpsPath();
 
 public:
   MOBase::IModRepositoryBridge *createNexusBridge() const;
@@ -186,8 +201,10 @@ public:
   DownloadManager *downloadManager();
   PluginList *pluginList();
   ModList *modList();
+  HANDLE runShortcut(const MOShortcut& shortcut);
   HANDLE startApplication(const QString &executable, const QStringList &args, const QString &cwd, const QString &profile);
   bool waitForApplication(HANDLE processHandle, LPDWORD exitCode = nullptr);
+  HANDLE findAndOpenAUSVFSProcess();
   bool onModInstalled(const std::function<void (const QString &)> &func);
   bool onAboutToRun(const std::function<bool (const QString &)> &func);
   bool onFinishedRun(const std::function<void (const QString &, unsigned int)> &func);
@@ -261,7 +278,7 @@ private:
               const MOShared::DirectoryEntry *directoryEntry,
               int createDestination);
 
-  bool waitForProcessCompletion(HANDLE handle, LPDWORD exitCode);
+  bool waitForProcessCompletion(HANDLE handle, LPDWORD exitCode, ILockedWaitingForProcess* uilock);
 
 private slots:
 
@@ -296,6 +313,7 @@ private:
   ModList m_ModList;
   PluginList m_PluginList;
 
+
   QList<std::function<void()>> m_PostLoginTasks;
   QList<std::function<void()>> m_PostRefreshTasks;
 
@@ -319,6 +337,7 @@ private:
   MOBase::DelayedFileWriter m_PluginListsWriter;
   UsvfsConnector m_USVFS;
 
+  static CrashDumpsType m_globalCrashDumpsType;
 };
 
 #endif // ORGANIZERCORE_H
